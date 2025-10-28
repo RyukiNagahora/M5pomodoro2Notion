@@ -4,11 +4,12 @@
 #include <HTTPClient.h>
 #include <time.h>
 
-// TODO: 実際の値に置き換える
-const char *WIFI_SSID = "WHEREVER Guest";
-const char *WIFI_PASSWORD = "whereverguest";
-const char *NOTION_TOKEN = "ntn_R57245999051FMNEyjR6UTEpKKCieLu8nXa1IbaOyJudex";
-const char *NOTION_DATABASE_ID = "29a155367661802a9b99c7dfdd62c857";
+#if __has_include("secrets.h")
+#include "secrets.h"
+#else
+#include "secrets_template.h"
+#warning "Using secrets_template.h placeholders. Create secrets.h with real credentials."
+#endif
 
 const char *NOTION_API_ENDPOINT = "https://api.notion.com/v1/pages";
 const char *NOTION_VERSION = "2022-06-28";
@@ -153,7 +154,7 @@ String currentIsoTime() {
 }
 
 bool postNotionLog() {
-  secureClient.setInsecure(); // テスト用途: 実運用では証明書検証を行う
+  secureClient.setInsecure(); // テスト用途: 実環境では証明書検証を設定する
   HTTPClient http;
   if (!http.begin(secureClient, NOTION_API_ENDPOINT)) {
     Serial.println("Failed to initialize HTTP client.");

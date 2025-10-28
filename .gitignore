@@ -1,0 +1,10 @@
+# Ignore user secrets
+examples/NotionPostTest/secrets.h
+
+# PlatformIO build output
+.pio/
+
+# Arduino build extras
+*.bin
+*.elf
+*.map

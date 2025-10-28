@@ -38,8 +38,8 @@ M5Stack Basic から Notion データベースへログを投稿できるか確�
 - 通信エラー時のリトライ・ローカルキュー管理を設計し、安定運用に向けた実装へ移行する。
 
 ## 6. 同梱テストスケッチ
+- `examples/NotionPostTest/secrets_template.h` を `examples/NotionPostTest/secrets.h` としてコピーし、`WIFI_SSID`, `WIFI_PASSWORD`, `NOTION_TOKEN`, `NOTION_DATABASE_ID` を実際の値に更新する。`secrets.h` は `.gitignore` 済みのためリポジトリには含まれない。
 - `examples/NotionPostTest/NotionPostTest.ino` を Arduino IDE / PlatformIO で開いて書き込む。
-- スケッチ冒頭の `WIFI_SSID`, `WIFI_PASSWORD`, `NOTION_TOKEN`, `NOTION_DATABASE_ID` を必ず書き換える。
 - Notion 側のデータベースには Date 型プロパティ（例: `Date`）を用意しておく。送信されるのはボタンを押した日時のみ。
 - 起動時に Wi-Fi へ接続し、NTP 経由で現在時刻を取得する。LCD に「Wi-Fi Connected」が表示されたら `BtnA` を押して POST を実行できる。
 - `BtnB` を押すと Wi-Fi 接続処理を再試行し、必要であれば再同期を行う。
