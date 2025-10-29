@@ -8,3 +8,6 @@ examples/NotionPostTest/secrets.h
 *.bin
 *.elf
 *.map
+
+# Local credentials (excluded from Git)
+config/local_credentials.json
