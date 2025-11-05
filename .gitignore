@@ -1,5 +1,5 @@
 # Ignore user secrets
-examples/NotionPostTest/secrets.h
+# Note: examples folder has been removed
 
 # PlatformIO build output
 .pio/
