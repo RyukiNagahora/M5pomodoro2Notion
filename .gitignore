@@ -11,3 +11,7 @@ examples/NotionPostTest/secrets.h
 
 # Local credentials (excluded from Git)
 config/local_credentials.json
+data/config/local_credentials.json
+
+# Secrets header file (excluded from Git)
+secrets.h
