@@ -17,7 +17,3 @@ secrets.h
 
 # Local credentials JSON file
 config/local_credentials.json
-data/config/local_credentials.json
-
-# Secrets header file (excluded from Git)
-secrets.h
