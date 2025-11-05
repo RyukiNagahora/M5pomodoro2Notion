@@ -10,8 +10,7 @@ examples/NotionPostTest/secrets.h
 *.map
 
 # Local credentials (excluded from Git)
-config/local_credentials.json
-data/config/local_credentials.json
+# Note: SPIFFS is no longer used, credentials are in secrets.h
 
 # Secrets header file (excluded from Git)
 secrets.h
