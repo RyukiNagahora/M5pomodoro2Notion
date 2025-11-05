@@ -53,7 +53,7 @@ Arduino IDEで設定ファイルを別ファイル（`secrets.h`）として読�
 #define WIFI_SSID_2 "BackupWiFi"
 #define WIFI_PASSWORD_2 "BackupPassword123"
 #define NOTION_TOKEN "secret_xxxxxxxxxxxx"
-#define NOTION_DATABASE_ID "1d6155367661809aa714e596439955f1"
+#define NOTION_DATABASE_ID "YOUR_DATABASE_ID"
 ```
 
 ### ステップ4: コードをアップロード
