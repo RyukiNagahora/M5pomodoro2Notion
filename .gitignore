@@ -17,3 +17,6 @@ secrets.h
 
 # Local credentials JSON file
 config/local_credentials.json
+
+# Security check document (excluded from Git)
+docs/security_check.md
