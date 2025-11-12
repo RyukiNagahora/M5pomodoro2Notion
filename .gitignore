@@ -1,22 +1,7 @@
-# Ignore user secrets
-# Note: examples folder has been removed
-
-# PlatformIO build output
-.pio/
-
-# Arduino build extras
-*.bin
-*.elf
-*.map
-
-# Local credentials (excluded from Git)
-# Note: SPIFFS is no longer used, credentials are in secrets.h
-
 # Secrets header file (excluded from Git)
 secrets.h
 
-# Local credentials JSON file
-config/local_credentials.json
-
-# Security check document (excluded from Git)
-docs/security_check.md
+# Arduino build output
+*.bin
+*.elf
+*.map
