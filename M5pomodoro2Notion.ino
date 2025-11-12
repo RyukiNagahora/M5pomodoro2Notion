@@ -3,6 +3,7 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
 #include <vector>
 #include <algorithm>
 #include <esp_system.h>
@@ -22,10 +23,12 @@ namespace {
 constexpr unsigned long WORK_DURATION_MS = 25UL * 60UL * 1000UL;
 constexpr unsigned long BREAK_DURATION_MS = 5UL * 60UL * 1000UL;
 constexpr unsigned long UI_REFRESH_INTERVAL_MS = 200UL;
+constexpr unsigned long BUTTON_LONG_PRESS_MS = 200UL;
 constexpr unsigned long WIFI_CONNECT_TIMEOUT_MS = 15000UL;
 constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 15000UL;
 constexpr unsigned long QUEUE_RETRY_INTERVAL_MS = 10000UL;
 constexpr unsigned long STATUS_MESSAGE_DURATION_MS = 4000UL;
+constexpr size_t MAX_QUEUE_SIZE = 10;  // キューの最大保存数
 
 const char *NOTION_API_URL = "https://api.notion.com/v1/pages";
 const char *NOTION_VERSION = "2022-06-28";
@@ -72,6 +75,7 @@ struct NotionPendingItem {
 
 Credentials g_credentials;
 std::vector<NotionPendingItem> g_pendingQueue;
+Preferences g_prefs;  // 不揮発性メモリへのアクセス用
 
 TimerState g_timerState = TimerState::Waiting;
 TimerPhase g_currentPhase = TimerPhase::Work;
@@ -83,17 +87,25 @@ unsigned long g_totalAccumulatedMillis = 0;
 unsigned long g_lastUiRefresh = 0;
 unsigned long g_lastQueueAttempt = 0;
 unsigned long g_lastWifiAttempt = 0;
+size_t g_currentWifiIndex = 0;  // 現在試行中のWiFi設定のインデックス
 
 time_t g_sessionStartEpoch = 0;
 bool g_sessionActive = false;
 
-bool g_buzzerEnabled = true;
 bool g_timeSynced = false;
 bool g_queueDirty = false;
 
 String g_sessionId;
 String g_statusMessage;
 unsigned long g_statusMessageExpireAt = 0;
+String g_connectedSsid;  // 接続中のWiFi SSID
+bool g_wifiConnecting = false;  // WiFi接続試行中フラグ
+
+// ボタン長押し検知用
+unsigned long g_buttonAPressStart = 0;
+unsigned long g_buttonCPressStart = 0;
+bool g_buttonAHandled = false;
+bool g_buttonCHandled = false;
 
 TFT_eSprite g_canvas = TFT_eSprite(&M5.Lcd);
 
@@ -102,7 +114,6 @@ TimerPhase g_lastUiPhase = TimerPhase::Work;
 unsigned long g_lastUiTotalSeconds = 0;
 unsigned long g_lastUiTimeLeftSeconds = 0;
 bool g_lastUiPaused = false;
-bool g_lastUiBuzzer = true;
 size_t g_lastUiQueueSize = 0;
 bool g_lastUiWifiStatus = false;
 
@@ -135,9 +146,9 @@ String weekdayIdFromTime(const tm &timeinfo);
 float toRoundedQuarterHours(unsigned long millisValue);
 void buzzStart();
 void buzzComplete();
+void buzzShortBeep();
 void resetSession(bool regenerateSessionId);
 void handleStartPauseButton();
-void handleBuzzerToggle();
 void handleSendButton();
 void attemptImmediateQueueFlush();
 void loadCredentialsFromSecrets();
@@ -183,77 +194,115 @@ void setup() {
     while(1) delay(1000);  // WiFi接続できないため停止
   #endif
 
-  // WiFi接続フェーズ：接続成功まで待機
-  M5.Lcd.fillScreen(TFT_BLACK);
-  M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-  M5.Lcd.setTextSize(2);
-  M5.Lcd.setCursor(10, 10);
-  M5.Lcd.print("Connecting WiFi...");
-  
-  bool wifiConnected = false;
-  unsigned long wifiStartTime = millis();
-  const unsigned long MAX_WAIT_TIME = 60000;  // 最大60秒待機
-  
-  while (!wifiConnected && (millis() - wifiStartTime < MAX_WAIT_TIME)) {
-    wifiConnected = connectWiFiAndWait(true);
-    
-    if (!wifiConnected) {
-      M5.Lcd.setCursor(10, 40);
-      M5.Lcd.setTextColor(TFT_YELLOW, TFT_BLACK);
-      M5.Lcd.print("Retrying...");
-      delay(2000);
-      M5.Lcd.fillRect(0, 40, 320, 40, TFT_BLACK);
-    }
-  }
-  
-  if (!wifiConnected) {
-    M5.Lcd.fillScreen(TFT_BLACK);
-    M5.Lcd.setTextColor(TFT_RED, TFT_BLACK);
-    M5.Lcd.setTextSize(2);
-    M5.Lcd.setCursor(10, 10);
-    M5.Lcd.print("WiFi Failed");
-    M5.Lcd.setCursor(10, 40);
-    M5.Lcd.print("Cannot continue");
-    while(1) delay(1000);  // WiFi接続失敗のため停止
-  }
-  
-  // WiFi接続成功
-  M5.Lcd.fillScreen(TFT_BLACK);
-  M5.Lcd.setTextColor(TFT_GREEN, TFT_BLACK);
-  M5.Lcd.setCursor(10, 10);
-  M5.Lcd.print("WiFi Connected!");
-  delay(1000);
+  // WiFi接続をバックグラウンドで開始（接続待機しない）
+  g_wifiConnecting = true;
+  connectWiFi(true);
+
+  // 不揮発性メモリからキューを復元
+  ensureQueueLoaded();
 
   generateSessionId();
   resetSession(false);
 
-  syncTime();
-
+  // 時刻同期はWiFi接続後にバックグラウンドで実行される
   updateUi(true);
 }
 
 void loop() {
   M5.update();
 
-  if (M5.BtnA.wasPressed()) {
-    handleStartPauseButton();
+  // Aボタン長押し検知
+  if (M5.BtnA.isPressed()) {
+    if (g_buttonAPressStart == 0) {
+      // 押下開始
+      g_buttonAPressStart = millis();
+      g_buttonAHandled = false;
+    } else if (!g_buttonAHandled && (millis() - g_buttonAPressStart >= BUTTON_LONG_PRESS_MS)) {
+      // 200ms経過、まだ処理していない
+      buzzShortBeep();
+      handleStartPauseButton();
+      g_buttonAHandled = true;
+      // ボタンが離されるまで待機（重複実行を防ぐ）
+      while (M5.BtnA.isPressed()) {
+        M5.update();
+        delay(10);
+      }
+      // ボタンが離されたのでリセット
+      g_buttonAPressStart = 0;
+      g_buttonAHandled = false;
+    }
+  } else {
+    // ボタンが離された
+    g_buttonAPressStart = 0;
+    g_buttonAHandled = false;
   }
-  if (M5.BtnB.wasPressed()) {
-    handleBuzzerToggle();
-  }
-  if (M5.BtnC.wasPressed()) {
-    handleSendButton();
+  
+  // Cボタン長押し検知
+  if (M5.BtnC.isPressed()) {
+    if (g_buttonCPressStart == 0) {
+      // 押下開始
+      g_buttonCPressStart = millis();
+      g_buttonCHandled = false;
+    } else if (!g_buttonCHandled && (millis() - g_buttonCPressStart >= BUTTON_LONG_PRESS_MS)) {
+      // 200ms経過、まだ処理していない
+      buzzShortBeep();
+      handleSendButton();
+      g_buttonCHandled = true;
+      // ボタンが離されるまで待機（重複実行を防ぐ）
+      while (M5.BtnC.isPressed()) {
+        M5.update();
+        delay(10);
+      }
+      // ボタンが離されたのでリセット
+      g_buttonCPressStart = 0;
+      g_buttonCHandled = false;
+    }
+  } else {
+    // ボタンが離された
+    g_buttonCPressStart = 0;
+    g_buttonCHandled = false;
   }
 
   updateTimer();
   attemptImmediateQueueFlush();
 
-  // Periodically retry Wi-Fi if disconnected
-  if (WiFi.status() != WL_CONNECTED) {
-    unsigned long now = millis();
-    if (now - g_lastWifiAttempt > WIFI_RETRY_INTERVAL_MS) {
-      connectWiFi(true);
-      g_lastWifiAttempt = now;
+  // WiFi接続をバックグラウンドで継続的に試行
+  unsigned long now = millis();
+  if (WiFi.status() == WL_CONNECTED) {
+    // 接続成功時
+    if (g_wifiConnecting || g_connectedSsid.length() == 0) {
+      g_wifiConnecting = false;
+      g_connectedSsid = WiFi.SSID();
+      g_currentWifiIndex = 0;  // 接続成功したらインデックスをリセット
+      if (!g_timeSynced) {
+        syncTime();
+      }
+      // WiFi接続成功時にキューを処理
+      attemptImmediateQueueFlush();
+      updateUi(true);
+    }
+  } else {
+    // 未接続時
+    g_connectedSsid = "";  // SSIDをクリア
+    if (!g_wifiConnecting) {
+      // 接続試行中でない場合、次の試行タイミングをチェック
+      if (now - g_lastWifiAttempt > WIFI_RETRY_INTERVAL_MS) {
+        // 次のWiFi設定を試行
+        g_wifiConnecting = true;
+        connectWiFi(true);
+        g_lastWifiAttempt = now;
+      }
+    } else {
+      // 接続試行中：タイムアウトチェック
+      if (now - g_lastWifiAttempt > WIFI_CONNECT_TIMEOUT_MS) {
+        // タイムアウト：次のWiFi設定を試行
+        g_wifiConnecting = false;
+        g_currentWifiIndex++;
+        if (g_currentWifiIndex >= g_credentials.wifiNetworks.size()) {
+          g_currentWifiIndex = 0;  // すべて試行したら最初に戻る
+        }
+        g_lastWifiAttempt = now;
+      }
     }
   }
 
@@ -322,23 +371,13 @@ void connectWiFi(bool force) {
   WiFi.disconnect(true);
   WiFi.mode(WIFI_STA);
 
-  for (const auto &cred : g_credentials.wifiNetworks) {
+  // バックグラウンド接続：現在のインデックスのWiFi設定を試行開始
+  // 実際の接続確認はloop()で行う
+  if (!g_credentials.wifiNetworks.empty() && g_currentWifiIndex < g_credentials.wifiNetworks.size()) {
+    const auto &cred = g_credentials.wifiNetworks[g_currentWifiIndex];
     WiFi.begin(cred.ssid.c_str(), cred.password.c_str());
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
-      delay(200);
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      break;
-    }
+    g_lastWifiAttempt = millis();
   }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    setStatusMessage("Wi-Fi disconnected");
-  } else {
-    setStatusMessage("Wi-Fi connected", 2000);
-  }
-  updateUi(true);
 }
 
 void loadCredentialsFromSecrets() {
@@ -537,16 +576,88 @@ void generateSessionId() {
   g_sessionId = String(buffer);
 }
 
-// Queue機能はメモリ上のみで動作（SPIFFS不要）
-// キューはメモリ上に保持され、再起動時にクリアされます
+// Queue機能：不揮発性メモリ（Preferences/NVS）に保存
+// キューは再起動後も保持され、未送信データが失われません
 void ensureQueueLoaded() {
-  // メモリ上のみで動作するため、読み込み処理は不要
   g_pendingQueue.clear();
+  
+  if (!g_prefs.begin("pomodoro", true)) {  // 読み取り専用モード
+    Serial.println("[QUEUE] Failed to open preferences");
+    return;
+  }
+  
+  String queueJson = g_prefs.getString("queue", "");
+  g_prefs.end();
+  
+  if (queueJson.length() == 0) {
+    Serial.println("[QUEUE] No saved queue found");
+    return;
+  }
+  
+  // JSONをパースしてキューに復元
+  DynamicJsonDocument doc(4096);
+  DeserializationError error = deserializeJson(doc, queueJson);
+  
+  if (error) {
+    Serial.printf("[QUEUE] Failed to parse JSON: %s\n", error.c_str());
+    return;
+  }
+  
+  JsonArray items = doc["items"].as<JsonArray>();
+  for (JsonObject itemObj : items) {
+    NotionPendingItem item;
+    item.sessionStart = itemObj["sessionStart"].as<time_t>();
+    item.logTime = itemObj["logTime"].as<time_t>();
+    item.roundedHours = itemObj["roundedHours"].as<float>();
+    item.isoDate = itemObj["isoDate"].as<String>();
+    item.displayDate = itemObj["displayDate"].as<String>();
+    item.notes = itemObj["notes"].as<String>();
+    item.weekdayId = itemObj["weekdayId"].as<String>();
+    g_pendingQueue.push_back(item);
+  }
+  
+  Serial.printf("[QUEUE] Loaded %d items from NVS\n", g_pendingQueue.size());
 }
 
 void saveQueue() {
-  // メモリ上のみで動作するため、保存処理は不要
-  // キューはメモリ上に保持され、再起動時にクリアされます
+  if (!g_prefs.begin("pomodoro", false)) {  // 読み書きモード
+    Serial.println("[QUEUE] Failed to open preferences for writing");
+    return;
+  }
+  
+  if (g_pendingQueue.empty()) {
+    // キューが空の場合はNVSからも削除
+    g_prefs.remove("queue");
+    Serial.println("[QUEUE] Cleared queue from NVS");
+    g_prefs.end();
+    return;
+  }
+  
+  // キューをJSONにシリアライズ
+  DynamicJsonDocument doc(4096);
+  JsonArray items = doc.createNestedArray("items");
+  
+  for (const auto &item : g_pendingQueue) {
+    JsonObject itemObj = items.createNestedObject();
+    itemObj["sessionStart"] = item.sessionStart;
+    itemObj["logTime"] = item.logTime;
+    itemObj["roundedHours"] = item.roundedHours;
+    itemObj["isoDate"] = item.isoDate;
+    itemObj["displayDate"] = item.displayDate;
+    itemObj["notes"] = item.notes;
+    itemObj["weekdayId"] = item.weekdayId;
+  }
+  
+  String queueJson;
+  serializeJson(doc, queueJson);
+  
+  if (g_prefs.putString("queue", queueJson)) {
+    Serial.printf("[QUEUE] Saved %d items to NVS\n", g_pendingQueue.size());
+  } else {
+    Serial.println("[QUEUE] Failed to save to NVS");
+  }
+  
+  g_prefs.end();
 }
 
 void setStatusMessage(const String &message, unsigned long duration) {
@@ -571,9 +682,7 @@ void startPhase(TimerPhase phase) {
   g_stateStartMillis = millis();
   g_pauseStartMillis = 0;
 
-  if (g_buzzerEnabled) {
-    buzzStart();
-  }
+  buzzStart();
   updateUi(true);
 }
 
@@ -583,7 +692,7 @@ void enterWaitingState(TimerPhase upcomingPhase, bool fromCompletion) {
   g_stateStartMillis = 0;
   g_pauseStartMillis = 0;
   g_currentPhase = upcomingPhase;
-  if (fromCompletion && g_buzzerEnabled) {
+  if (fromCompletion) {
     buzzComplete();
   }
   updateUi(true);
@@ -657,7 +766,6 @@ void updateUi(bool force) {
                       totalSeconds != g_lastUiTotalSeconds ||
                       timeLeftSeconds != g_lastUiTimeLeftSeconds ||
                       isPaused != g_lastUiPaused ||
-                      g_buzzerEnabled != g_lastUiBuzzer ||
                       g_pendingQueue.size() != g_lastUiQueueSize ||
                       wifiConnected != g_lastUiWifiStatus ||
                       (!g_statusMessage.isEmpty() && millis() < g_statusMessageExpireAt);
@@ -674,7 +782,6 @@ void updateUi(bool force) {
     drawActiveScreen(isPaused, timeLeftMillis, totalMillis);
   }
 
-  drawStatusFooter();
   g_canvas.pushSprite(0, 0);
 
   g_lastUiState = g_timerState;
@@ -682,124 +789,301 @@ void updateUi(bool force) {
   g_lastUiTotalSeconds = totalSeconds;
   g_lastUiTimeLeftSeconds = timeLeftSeconds;
   g_lastUiPaused = isPaused;
-  g_lastUiBuzzer = g_buzzerEnabled;
   g_lastUiQueueSize = g_pendingQueue.size();
   g_lastUiWifiStatus = wifiConnected;
 }
 
 void drawWaitingScreen(unsigned long totalMillis) {
-  g_canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+  uint16_t textColor = TFT_WHITE;
+  
+  // バーの設定（アクティブ画面と同じ）
+  const int barY = 20;
+  const int barHeight = 80;
+  const int canvasWidth = g_canvas.width();
+  
+  // 待機画面用のバー（グレーで表示、横幅100%）
+  uint16_t barColor = TFT_DARKGREY;
+  g_canvas.fillRect(0, barY, canvasWidth, barHeight, barColor);
+  
+  // バーの中に重ねて表示する情報
+  // 左寄せ：Stateと次のフェーズ
+  g_canvas.setTextColor(textColor, barColor);
   g_canvas.setTextSize(2);
-  g_canvas.setCursor(10, 10);
-  g_canvas.print("State: ");
-  g_canvas.print(stateLabel(TimerState::Waiting));
+  String statePhaseText = "Waiting / Next: " + phaseLabel(g_nextPhase);
+  int textY = barY + 15;
+  g_canvas.setCursor(10, textY);
+  g_canvas.print(statePhaseText);
+  
+  // 右寄せ：待機中なので残り時間は表示しない（または「--:--」を表示）
+  // アクティブ画面と同じ位置に配置するが、待機中は表示しない
 
-  g_canvas.setCursor(10, 40);
-  g_canvas.printf("Next: %s", phaseLabel(g_nextPhase).c_str());
-
-  g_canvas.setCursor(10, 70);
+  // バーの下に表示：トータル経過時間と丸め込み値（アクティブ画面と同じ位置）
+  g_canvas.setTextColor(textColor, TFT_BLACK);
+  g_canvas.setTextSize(2);
+  int infoY = barY + barHeight + 10;
+  g_canvas.setCursor(10, infoY);
   g_canvas.print("Total: ");
   g_canvas.print(formatDuration(totalMillis));
 
   float roundedHours = toRoundedQuarterHours(totalMillis);
-  g_canvas.setCursor(10, 100);
+  g_canvas.setCursor(10, infoY + 25);
   g_canvas.printf("Rounded: %.2fh", roundedHours);
 
+  // その下に小さく表示：ボタンアサイン、WiFi、キュー、POST状態など（アクティブ画面と同じ位置）
   g_canvas.setTextSize(1);
-  const int waitingMessageY = 130;
-  const int waitingButtonsStartY = 160;
-
-  if (!g_statusMessage.isEmpty() && millis() < g_statusMessageExpireAt) {
-    g_canvas.setTextColor(TFT_YELLOW, TFT_BLACK);
-    g_canvas.setCursor(10, waitingMessageY);
-    g_canvas.println(g_statusMessage);
-    g_canvas.setTextColor(TFT_WHITE, TFT_BLACK);
-  }
-
-  int waitingButtonY = waitingButtonsStartY;
-  g_canvas.setCursor(10, waitingButtonY);
+  int detailY = infoY + 55;
+  
+  // ボタンアサイン
+  g_canvas.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  g_canvas.setCursor(10, detailY);
   g_canvas.print("A: Start");
-  waitingButtonY += 15;
-  g_canvas.setCursor(10, waitingButtonY);
-  g_canvas.print("B: Buzzer On/Off");
-  waitingButtonY += 15;
-  g_canvas.setCursor(10, waitingButtonY);
+  g_canvas.setCursor(10, detailY + 12);
   g_canvas.print("C: Send & Reset");
 
-  g_canvas.setCursor(10, 205);
-  g_canvas.printf("Session: %s", g_sessionId.c_str());
+  // WiFi接続状態
+  String wifiStatus;
+  uint16_t wifiColor;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (g_connectedSsid.length() > 0) {
+      wifiStatus = "Wi-Fi: " + g_connectedSsid;
+    } else {
+      wifiStatus = "Wi-Fi: Connected";
+    }
+    wifiColor = TFT_GREEN;
+  } else if (g_wifiConnecting) {
+    wifiStatus = "Wi-Fi: Connecting...";
+    wifiColor = TFT_YELLOW;
+  } else {
+    wifiStatus = "Wi-Fi: Offline";
+    wifiColor = TFT_LIGHTGREY;
+  }
+  g_canvas.setTextColor(wifiColor, TFT_BLACK);
+  g_canvas.setCursor(10, detailY + 24);
+  g_canvas.print(wifiStatus);
+
+  // キュー状態
+  size_t queueSize = g_pendingQueue.size();
+  uint16_t queueColor;
+  if (queueSize == 0) {
+    queueColor = TFT_LIGHTGREY;  // 空：グレー
+  } else if (queueSize <= 3) {
+    queueColor = TFT_GREEN;  // 少ない：緑色
+  } else if (queueSize <= 7) {
+    queueColor = TFT_YELLOW;  // 中程度：黄色
+  } else {
+    queueColor = TFT_RED;  // 多い：赤色
+  }
+  g_canvas.setTextColor(queueColor, TFT_BLACK);
+  g_canvas.setCursor(10, detailY + 36);
+  g_canvas.printf("Queue: %d / %d",
+                  static_cast<int>(queueSize),
+                  static_cast<int>(MAX_QUEUE_SIZE));
+
+  // 電池残量
+  int batteryLevel = M5.Power.getBatteryLevel();
+  uint16_t batteryColor;
+  if (batteryLevel > 50) {
+    batteryColor = TFT_GREEN;
+  } else if (batteryLevel > 20) {
+    batteryColor = TFT_YELLOW;
+  } else {
+    batteryColor = TFT_RED;
+  }
+  g_canvas.setTextColor(batteryColor, TFT_BLACK);
+  g_canvas.setCursor(10, detailY + 48);
+  g_canvas.printf("Battery: %d%%", batteryLevel);
+
+  // ステータスメッセージ（POST状態など）
+  if (!g_statusMessage.isEmpty() && millis() < g_statusMessageExpireAt) {
+    g_canvas.setTextColor(TFT_YELLOW, TFT_BLACK);
+    g_canvas.setCursor(10, detailY + 60);
+    g_canvas.print(g_statusMessage);
+    g_canvas.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  }
 }
 
 void drawActiveScreen(bool paused, unsigned long timeLeftMillis, unsigned long totalMillis) {
   uint16_t barColor = (g_currentPhase == TimerPhase::Work) ? 0xf920 : 0x051f;
   uint16_t textColor = TFT_WHITE;
 
+  // バーの設定
+  const int barY = 20;  // バーのY位置（上に余白を確保）
+  const int barHeight = 80;  // バーの高さ（広げる）
+  const int canvasWidth = g_canvas.width();
+
   unsigned long duration = currentPhaseDuration();
   unsigned long elapsed = currentPhaseElapsed();
   float progress = clampValue(static_cast<float>(elapsed) / static_cast<float>(duration), 0.0f, 1.0f);
-  int barWidth = static_cast<int>(progress * g_canvas.width());
+  // 残り時間に応じて幅が小さくなる（100%から始まって0%に近づく）
+  float remainingProgress = 1.0f - progress;
+  int barWidth = static_cast<int>(remainingProgress * canvasWidth);
 
-  g_canvas.fillRect(0, 0, barWidth, 80, barColor);
+  // バーの背景（黒）を描画
+  g_canvas.fillRect(0, barY, canvasWidth, barHeight, TFT_BLACK);
+  // 残り時間に応じたバーを描画
+  g_canvas.fillRect(0, barY, barWidth, barHeight, barColor);
 
+  // バーの中に重ねて表示する情報
+  // 左寄せ：Stateとフェーズ（バーの中に表示）
+  // バーの色の上に白文字で表示（背景色は透明ではなく、バーの色を指定）
+  g_canvas.setTextColor(textColor, barColor);
+  g_canvas.setTextSize(2);
+  String stateText;
+  if (paused) {
+    stateText = "Paused";
+    g_canvas.setTextColor(TFT_YELLOW, barColor);
+  } else {
+    stateText = "Running";
+    g_canvas.setTextColor(textColor, barColor);
+  }
+  String statePhaseText = stateText + " / " + phaseLabel(g_currentPhase);
+  // バーの中央より上に配置
+  int textY = barY + 15;
+  g_canvas.setCursor(10, textY);
+  g_canvas.print(statePhaseText);
+
+  // 右寄せ：残り時間（大きく表示、バーの中に表示）
+  // バーの幅が小さくなっても見えるように、常に画面右端に表示
+  g_canvas.setTextSize(4);
+  String timeLeftStr = formatDuration(timeLeftMillis);
+  int textWidth = g_canvas.textWidth(timeLeftStr);
+  // バーの中央より下に配置
+  int timeY = barY + 45;
+  int timeX = canvasWidth - textWidth - 10;
+  
+  // 残り時間のテキスト全体がバーの範囲内にあるかどうかを判定
+  // テキストの開始位置と終了位置（timeX + textWidth）を考慮
+  if (timeX + textWidth <= barWidth) {
+    // テキスト全体がバーの範囲内
+    g_canvas.setTextColor(textColor, barColor);
+  } else {
+    // テキストがバーの範囲外（または一部が範囲外）
+    g_canvas.setTextColor(textColor, TFT_BLACK);
+  }
+  g_canvas.setCursor(timeX, timeY);
+  g_canvas.print(timeLeftStr);
+
+  // バーの下に表示：トータル経過時間と丸め込み値
   g_canvas.setTextColor(textColor, TFT_BLACK);
   g_canvas.setTextSize(2);
-  g_canvas.setCursor(10, 10);
-  g_canvas.printf("%s", phaseLabel(g_currentPhase).c_str());
-
-  g_canvas.setCursor(10, 40);
-  if (paused) {
-    g_canvas.setTextColor(TFT_YELLOW, TFT_BLACK);
-    g_canvas.setTextSize(3);
-    g_canvas.print("Paused");
-    g_canvas.setTextSize(2);
-    g_canvas.setTextColor(textColor, TFT_BLACK);
-  } else {
-    g_canvas.print("Running");
-  }
-
-  g_canvas.setCursor(10, 80);
-  g_canvas.print("Time left: ");
-  g_canvas.print(formatDuration(timeLeftMillis));
-
-  g_canvas.setCursor(10, 110);
+  int infoY = barY + barHeight + 10;
+  g_canvas.setCursor(10, infoY);
   g_canvas.print("Total: ");
   g_canvas.print(formatDuration(totalMillis));
 
   float roundedHours = toRoundedQuarterHours(totalMillis);
-  g_canvas.setCursor(10, 140);
+  g_canvas.setCursor(10, infoY + 25);
   g_canvas.printf("Rounded: %.2fh", roundedHours);
 
+  // その下に小さく表示：ボタンアサイン、WiFi、キュー、POST状態など
   g_canvas.setTextSize(1);
-
-  const int activeMessageY = 130;
-  const int activeButtonsStartY = 160;
-  if (!g_statusMessage.isEmpty() && millis() < g_statusMessageExpireAt) {
-    g_canvas.setTextColor(TFT_YELLOW, TFT_BLACK);
-    g_canvas.setCursor(10, activeMessageY);
-    g_canvas.println(g_statusMessage);
-    g_canvas.setTextColor(TFT_WHITE, TFT_BLACK);
+  int detailY = infoY + 55;
+  
+  // ボタンアサイン
+  g_canvas.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  g_canvas.setCursor(10, detailY);
+  if (paused) {
+    g_canvas.print("A: Resume");
+  } else {
+    g_canvas.print("A: Pause");
   }
-
-  int activeButtonY = activeButtonsStartY;
-  g_canvas.setCursor(10, activeButtonY);
-  g_canvas.print("A: Pause/Resume");
-  activeButtonY += 15;
-  g_canvas.setCursor(10, activeButtonY);
+  g_canvas.setCursor(10, detailY + 12);
   g_canvas.print("C: Send & Reset");
 
-  g_canvas.setCursor(10, 205);
-  g_canvas.printf("Session: %s", g_sessionId.c_str());
+  // WiFi接続状態
+  String wifiStatus;
+  uint16_t wifiColor;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (g_connectedSsid.length() > 0) {
+      wifiStatus = "Wi-Fi: " + g_connectedSsid;
+    } else {
+      wifiStatus = "Wi-Fi: Connected";
+    }
+    wifiColor = TFT_GREEN;
+  } else if (g_wifiConnecting) {
+    wifiStatus = "Wi-Fi: Connecting...";
+    wifiColor = TFT_YELLOW;
+  } else {
+    wifiStatus = "Wi-Fi: Offline";
+    wifiColor = TFT_LIGHTGREY;
+  }
+  g_canvas.setTextColor(wifiColor, TFT_BLACK);
+  g_canvas.setCursor(10, detailY + 24);
+  g_canvas.print(wifiStatus);
+
+  // キュー状態
+  size_t queueSize = g_pendingQueue.size();
+  uint16_t queueColor;
+  if (queueSize == 0) {
+    queueColor = TFT_LIGHTGREY;  // 空：グレー
+  } else if (queueSize <= 3) {
+    queueColor = TFT_GREEN;  // 少ない：緑色
+  } else if (queueSize <= 7) {
+    queueColor = TFT_YELLOW;  // 中程度：黄色
+  } else {
+    queueColor = TFT_RED;  // 多い：赤色
+  }
+  g_canvas.setTextColor(queueColor, TFT_BLACK);
+  g_canvas.setCursor(10, detailY + 36);
+  g_canvas.printf("Queue: %d / %d",
+                  static_cast<int>(queueSize),
+                  static_cast<int>(MAX_QUEUE_SIZE));
+
+  // 電池残量
+  int batteryLevel = M5.Power.getBatteryLevel();
+  uint16_t batteryColor;
+  if (batteryLevel > 50) {
+    batteryColor = TFT_GREEN;
+  } else if (batteryLevel > 20) {
+    batteryColor = TFT_YELLOW;
+  } else {
+    batteryColor = TFT_RED;
+  }
+  g_canvas.setTextColor(batteryColor, TFT_BLACK);
+  g_canvas.setCursor(10, detailY + 48);
+  g_canvas.printf("Battery: %d%%", batteryLevel);
+
+  // ステータスメッセージ（POST状態など）
+  if (!g_statusMessage.isEmpty() && millis() < g_statusMessageExpireAt) {
+    g_canvas.setTextColor(TFT_YELLOW, TFT_BLACK);
+    g_canvas.setCursor(10, detailY + 60);
+    g_canvas.print(g_statusMessage);
+    g_canvas.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  }
 }
 
 void drawStatusFooter() {
   int baseY = 220;
   g_canvas.setTextSize(1);
-  g_canvas.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  
+  // WiFi接続状態を表示
+  String wifiStatus;
+  uint16_t wifiColor;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (g_connectedSsid.length() > 0) {
+      wifiStatus = "Wi-Fi: " + g_connectedSsid;
+    } else {
+      wifiStatus = "Wi-Fi: Connected";
+    }
+    wifiColor = TFT_GREEN;
+  } else if (g_wifiConnecting) {
+    wifiStatus = "Wi-Fi: Connecting...";
+    wifiColor = TFT_YELLOW;
+  } else {
+    wifiStatus = "Wi-Fi: Offline";
+    wifiColor = TFT_LIGHTGREY;
+  }
+  
+  g_canvas.setTextColor(wifiColor, TFT_BLACK);
   g_canvas.setCursor(10, baseY);
-  g_canvas.printf("Wi-Fi: %s  Queue: %d  Buzzer: %s",
-                  (WiFi.status() == WL_CONNECTED) ? "Connected" : "Offline",
+  g_canvas.print(wifiStatus);
+  
+  // キュー状態を表示
+  g_canvas.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  g_canvas.setCursor(10, baseY + 12);
+  g_canvas.printf("Queue: %d / %d",
                   static_cast<int>(g_pendingQueue.size()),
-                  g_buzzerEnabled ? "On" : "Off");
+                  static_cast<int>(MAX_QUEUE_SIZE));
 }
 
 String phaseLabel(TimerPhase phase) {
@@ -866,9 +1150,14 @@ String weekdayIdFromTime(const tm &timeinfo) {
 }
 
 float toRoundedQuarterHours(unsigned long millisValue) {
-  double hours = static_cast<double>(millisValue) / 3600000.0;
-  double rounded = round(hours * 4.0) / 4.0;
-  return static_cast<float>(rounded);
+  // トータル経過時間（分）を計算
+  unsigned long totalMinutes = millisValue / (60 * 1000);
+  
+  // 15分刻みで0.25時間ずつ増やす法則を適用
+  // 1-15分 → 0.25時間、16-30分 → 0.5時間、31-45分 → 0.75時間、46-60分 → 1.0時間...
+  // 15分単位で切り上げて0.25を掛ける
+  double quarters = ceil(static_cast<double>(totalMinutes) / 15.0);
+  return static_cast<float>(quarters * 0.25);
 }
 
 void buzzStart() {
@@ -876,9 +1165,17 @@ void buzzStart() {
 }
 
 void buzzComplete() {
-  M5.Speaker.tone(1000, 200);
-  delay(180);
-  M5.Speaker.tone(1400, 200);
+  // 短い2音を鳴らす
+  M5.Speaker.tone(1000, 150);
+  delay(100);
+  M5.Speaker.tone(1000, 150);
+}
+
+void buzzShortBeep() {
+  // 長押し検知時の短い1音
+  M5.Speaker.tone(800, 50);
+  delay(50);  // 音が確実に鳴るように待機
+  M5.Speaker.end();  // ブザーを明示的に停止
 }
 
 void resetSession(bool regenerateSessionId) {
@@ -921,11 +1218,6 @@ void handleStartPauseButton() {
   }
 }
 
-void handleBuzzerToggle() {
-  g_buzzerEnabled = !g_buzzerEnabled;
-  setStatusMessage(g_buzzerEnabled ? "Buzzer On" : "Buzzer Off", 2000);
-}
-
 void handleSendButton() {
   unsigned long totalMillis = computeTotalElapsedMillis();
   if (totalMillis == 0) {
@@ -947,7 +1239,7 @@ void handleSendButton() {
   item.roundedHours = toRoundedQuarterHours(totalMillis);
   item.isoDate = isoDateFromTime(startTimeInfo);
   item.displayDate = displayDateFromTime(startTimeInfo);
-  item.notes = formatTime(g_sessionStartEpoch, "%H:%M");
+  item.notes = formatTime(g_sessionStartEpoch, "%I:%M %p");
   item.weekdayId = weekdayIdFromTime(startTimeInfo);
 
   g_pendingQueue.push_back(item);
@@ -1036,6 +1328,9 @@ bool postToNotion(const NotionPendingItem &item) {
   JsonObject richText = richObj.createNestedObject("text");
   richText["content"] = item.weekdayId;
   richObj["plain_text"] = item.weekdayId;
+
+  JsonObject fromM5Prop = properties.createNestedObject("fromM5");
+  fromM5Prop["checkbox"] = true;
 
   String payload;
   serializeJson(doc, payload);
