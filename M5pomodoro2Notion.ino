@@ -283,8 +283,8 @@ void loop() {
     }
   } else {
     // 未接続時
-    g_connectedSsid = "";  // SSIDをクリア
     if (!g_wifiConnecting) {
+      g_connectedSsid = "";  // 接続試行中でない場合のみSSIDをクリア
       // 接続試行中でない場合、次の試行タイミングをチェック
       if (now - g_lastWifiAttempt > WIFI_RETRY_INTERVAL_MS) {
         // 次のWiFi設定を試行
@@ -375,6 +375,7 @@ void connectWiFi(bool force) {
   // 実際の接続確認はloop()で行う
   if (!g_credentials.wifiNetworks.empty() && g_currentWifiIndex < g_credentials.wifiNetworks.size()) {
     const auto &cred = g_credentials.wifiNetworks[g_currentWifiIndex];
+    g_connectedSsid = cred.ssid;  // 接続試行中のSSID名を保存
     WiFi.begin(cred.ssid.c_str(), cred.password.c_str());
     g_lastWifiAttempt = millis();
   }
@@ -851,7 +852,11 @@ void drawWaitingScreen(unsigned long totalMillis) {
     }
     wifiColor = TFT_GREEN;
   } else if (g_wifiConnecting) {
-    wifiStatus = "Wi-Fi: Connecting...";
+    if (g_connectedSsid.length() > 0) {
+      wifiStatus = "Wi-Fi: Connecting to " + g_connectedSsid;
+    } else {
+      wifiStatus = "Wi-Fi: Connecting...";
+    }
     wifiColor = TFT_YELLOW;
   } else {
     wifiStatus = "Wi-Fi: Offline";
@@ -1001,7 +1006,11 @@ void drawActiveScreen(bool paused, unsigned long timeLeftMillis, unsigned long t
     }
     wifiColor = TFT_GREEN;
   } else if (g_wifiConnecting) {
-    wifiStatus = "Wi-Fi: Connecting...";
+    if (g_connectedSsid.length() > 0) {
+      wifiStatus = "Wi-Fi: Connecting to " + g_connectedSsid;
+    } else {
+      wifiStatus = "Wi-Fi: Connecting...";
+    }
     wifiColor = TFT_YELLOW;
   } else {
     wifiStatus = "Wi-Fi: Offline";
@@ -1067,7 +1076,11 @@ void drawStatusFooter() {
     }
     wifiColor = TFT_GREEN;
   } else if (g_wifiConnecting) {
-    wifiStatus = "Wi-Fi: Connecting...";
+    if (g_connectedSsid.length() > 0) {
+      wifiStatus = "Wi-Fi: Connecting to " + g_connectedSsid;
+    } else {
+      wifiStatus = "Wi-Fi: Connecting...";
+    }
     wifiColor = TFT_YELLOW;
   } else {
     wifiStatus = "Wi-Fi: Offline";
